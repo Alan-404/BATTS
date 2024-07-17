@@ -7,6 +7,7 @@ import torch.distributed as distributed
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
+from torch.cuda.amp import autocast, GradScaler
 
 from model.batts import BATTS
 from model.modules.dvae import DiscreteVAE
@@ -15,6 +16,7 @@ from processing.processor import BATTSProcessor
 from processing.target import TargetBATTSProcessor
 
 from dataset import BATTSDataset, BATTSCollate
+from evaluation import BATTSCriterion
 
 from typing import Optional
 
@@ -51,7 +53,11 @@ def train(
 
         num_epochs: int = 1,
         batch_size: int = 1,
-        num_train_samples: Optional[int] = None
+        num_train_samples: Optional[int] = None,
+        fp16: float = True,
+        
+        checkpoint: Optional[str] = None,
+        saved_checkpoints: str = "./checkpoints"
     ):
     
     processor = BATTSProcessor(
@@ -85,6 +91,9 @@ def train(
         dropout_rate=dropout_rate
     )
 
+    optimizer = optim.Adam(params=model.parameters())
+    scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=0.99785)
+
     dvae = DiscreteVAE(
         channels=80,
         normalization=None,
@@ -99,11 +108,18 @@ def train(
         balancing_heuristic=False
     )
 
+    assert dvae_checkpoint is not None and os.path.exists(dvae_checkpoint)
+    dvae.load_state_dict(torch.load(dvae_checkpoint, map_location='cpu'))
+
+    model.to(rank)
+    dvae.to(rank)
+
     if world_size > 1:
-        model.to(rank)
-        dvae.to(rank)
+        model = DDP(model, device_ids=[rank])
+        dvae = DDP(dvae, device_ids=[rank])
 
     dvae.eval()
+    model.train()
 
     collate_fn = BATTSCollate(processor, handler)
 
@@ -111,4 +127,36 @@ def train(
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank) if world_size > 1 else RandomSampler(dataset)
     dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, collate_fn=collate_fn)
 
-    
+    scaler = GradScaler(enabled=fp16)
+    criterion = BATTSCriterion()
+
+    for epoch in range(num_epochs):
+        total_entropy_loss = 0.0
+
+        if world_size > 1:
+            dataloader.sampler.set_epoch(epoch)
+
+        for (x, cond, _, y, x_lengths, y_lengths) in dataloader:
+            x = x.to(rank)
+            cond = cond.to(rank)
+            y = y.to(rank)
+            x_lengths = x_lengths.to(rank)
+            y_lengths = y_lengths.to(rank)
+
+            with autocast(enabled=fp16):
+                with torch.no_grad():
+                    codebooks = dvae.get_codebook_indices(y)
+                    y_lengths = (y_lengths // 4) + 1
+                y_logits, y_target = model(x, cond, codebooks, x_lengths, y_lengths)
+
+                with autocast(enabled=False):
+                    loss = criterion(y_logits, y_target)
+            
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            scaler.step(optimizer)
+
+            total_entropy_loss += loss
+
+
