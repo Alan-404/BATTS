@@ -30,7 +30,7 @@ class GPTBlock(nn.Module):
 
         # sub - layer 3
         ffn = self.mlp(global_attn)
-        ffn = self.norm_2(F.dropout(ffn, p=self.dropout_p, training=self.training) + global_attn)
+        ffn = self.norm_3(F.dropout(ffn, p=self.dropout_p, training=self.training) + global_attn)
 
         return ffn
 
